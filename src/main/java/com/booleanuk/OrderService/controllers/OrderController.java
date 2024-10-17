@@ -85,8 +85,6 @@ public class OrderController {
                     Order order = objectMapper.readValue(orderJson, Order.class);
                     finalizeOrder(order);
 
-                    // Delete message from the queue if order is processed
-                    System.out.println("Order processed: " + order.isProcessed());
                     DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
                             .queueUrl(queueUrl)
                             .receiptHandle(message.receiptHandle())
