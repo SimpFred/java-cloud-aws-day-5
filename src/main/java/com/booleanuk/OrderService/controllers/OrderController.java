@@ -2,14 +2,15 @@ package com.booleanuk.OrderService.controllers;
 
 
 import com.booleanuk.OrderService.models.Order;
+import com.booleanuk.OrderService.repositories.OrderRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.web.bind.annotation.*;
-import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.eventbridge.EventBridgeClient;
 import software.amazon.awssdk.services.eventbridge.model.PutEventsRequest;
 import software.amazon.awssdk.services.eventbridge.model.PutEventsRequestEntry;
@@ -21,6 +22,7 @@ import software.amazon.awssdk.services.sqs.model.Message;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 
 import java.util.List;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("orders")
@@ -33,49 +35,99 @@ public class OrderController {
     private String topicArn;
     private String eventBusName;
 
+    @Autowired
+    private OrderRepository repository;
+
     public OrderController() {
         this.sqsClient = SqsClient.builder().build();
         this.snsClient = SnsClient.builder().build();
         this.eventBridgeClient = EventBridgeClient.builder().build();
 
-        this.queueUrl = "";
-        this.topicArn = "";
-        this.eventBusName = "";
+        this.queueUrl = "https://sqs.eu-west-1.amazonaws.com/637423341661/SimpFredOrderQueue";
+        this.topicArn = "arn:aws:sns:eu-west-1:637423341661:SimpFredOrderCreatedTopic";
+        this.eventBusName = "arn:aws:events:eu-west-1:637423341661:event-bus/SimpFredCustomEventBus";
 
         this.objectMapper = new ObjectMapper();
     }
 
     @GetMapping
-    public ResponseEntity<String> GetAllOrders() {
-        ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()
-                .queueUrl(queueUrl)
-                .maxNumberOfMessages(10)
-                .waitTimeSeconds(20)
-                .build();
+    public ResponseEntity<List<Order>> getAllOrders() {
+        List<Order> orders = repository.findAll();
+        processOrdersFromQueue();
+        return ResponseEntity.ok(orders);
+    }
 
-        List<Message> messages = sqsClient.receiveMessage(receiveRequest).messages();
 
-        for (Message message : messages) {
-            try {
-                Order order = this.objectMapper.readValue(message.body(), Order.class);
-                this.processOrder(order);
+    public void processOrdersFromQueue() {
+        while (true) {
+            ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()
+                    .queueUrl(queueUrl)
+                    .maxNumberOfMessages(10)
+                    .waitTimeSeconds(1)
+                    .build();
 
-                DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
-                        .queueUrl(queueUrl)
-                        .receiptHandle(message.receiptHandle())
-                        .build();
+            List<Message> messages = sqsClient.receiveMessage(receiveRequest).messages();
 
-                sqsClient.deleteMessage(deleteRequest);
-            } catch (JsonProcessingException e) {
-//                e.printStackTrace();
+            System.out.println("Received messages from the queue: " + messages.size());
+            if (messages.isEmpty()) {
+                break; // Exit loop if no more messages are available
             }
+
+            for (Message message : messages) {
+                try {
+                    // Extract the "Message" field from the SNS notification
+                    JsonNode messageNode = objectMapper.readTree(message.body());
+                    String orderJson = messageNode.get("Message").asText();
+
+                    System.out.println(orderJson);
+
+                    // Deserialize the order JSON to an Order object
+                    Order order = objectMapper.readValue(orderJson, Order.class);
+                    finalizeOrder(order);
+
+                    // Delete message from the queue if order is processed
+                    System.out.println("Order processed: " + order.isProcessed());
+                    DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
+                            .queueUrl(queueUrl)
+                            .receiptHandle(message.receiptHandle())
+                            .build();
+
+                    sqsClient.deleteMessage(deleteRequest);
+                } catch (JsonProcessingException e) {
+                    e.printStackTrace();
+                }
+            }
+            System.out.println("Processed orders in background: " + messages.size());
         }
-        String status = String.format("%d Orders have been processed", messages.size());
-        return ResponseEntity.ok(status);
     }
 
     @PostMapping
-    public ResponseEntity<String> createOrder(@RequestBody Order order) {
+    public ResponseEntity<Order> createOrder(@RequestBody Order order) {
+        System.out.println(order.toString());
+        Order newOrder = repository.save(order);
+        publishOrderEvent(newOrder);
+        return new ResponseEntity<>(newOrder, HttpStatus.CREATED);
+    }
+
+    @PutMapping("/{id}")
+    public ResponseEntity<Order> updateOrder(@PathVariable int id, @RequestBody Order orderDetails) {
+        Optional<Order> optionalOrder = repository.findById(id);
+        if (optionalOrder.isPresent()) {
+            Order order = optionalOrder.get();
+            order.setProduct(orderDetails.getProduct());
+            order.setQuantity(orderDetails.getQuantity());
+            order.setAmount(orderDetails.getAmount());
+            order.setProcessed(orderDetails.isProcessed());
+            Order updatedOrder = repository.save(order);
+            publishOrderEvent(updatedOrder);
+            return ResponseEntity.ok(updatedOrder);
+        } else {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(null);
+        }
+    }
+
+    @Async
+    public void publishOrderEvent(Order order) {
         try {
             String orderJson = objectMapper.writeValueAsString(order);
             System.out.println(orderJson);
@@ -98,15 +150,15 @@ public class OrderController {
 
             this.eventBridgeClient.putEvents(putEventsRequest);
 
-            String status = "Order created, Message Published to SNS and Event Emitted to EventBridge";
-            return ResponseEntity.ok(status);
         } catch (JsonProcessingException e) {
-//            e.printStackTrace();
-            return ResponseEntity.status(500).body("Failed to create order");
+            e.printStackTrace();
         }
     }
 
-    private void processOrder(Order order) {
+    private void finalizeOrder(Order order) {
+        order.calculateTotal();
+        order.setProcessed(true);
+        repository.save(order);
         System.out.println(order.toString());
     }
 }
