@@ -126,7 +126,6 @@ public class OrderController {
         }
     }
 
-    @Async
     public void publishOrderEvent(Order order) {
         try {
             String orderJson = objectMapper.writeValueAsString(order);
