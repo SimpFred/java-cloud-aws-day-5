@@ -10,6 +10,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.bind.annotation.*;
 import software.amazon.awssdk.services.eventbridge.EventBridgeClient;
 import software.amazon.awssdk.services.eventbridge.model.PutEventsRequest;
@@ -53,50 +55,43 @@ public class OrderController {
     @GetMapping
     public ResponseEntity<List<Order>> getAllOrders() {
         List<Order> orders = repository.findAll();
-        processOrdersFromQueue();
         return ResponseEntity.ok(orders);
     }
 
-
+    @Scheduled(fixedRate = 5000)
     public void processOrdersFromQueue() {
-        while (true) {
-            ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()
-                    .queueUrl(queueUrl)
-                    .maxNumberOfMessages(10)
-                    .waitTimeSeconds(1)
-                    .build();
+        ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()
+                .queueUrl(queueUrl)
+                .maxNumberOfMessages(10)
+                .waitTimeSeconds(1)
+                .build();
 
-            List<Message> messages = sqsClient.receiveMessage(receiveRequest).messages();
+        List<Message> messages = sqsClient.receiveMessage(receiveRequest).messages();
 
-            System.out.println("Received messages from the queue: " + messages.size());
-            if (messages.isEmpty()) {
-                break; // Exit loop if no more messages are available
+        System.out.println("Received messages from the queue: " + messages.size());
+        for (Message message : messages) {
+            try {
+                // Extract the "Message" field from the SNS notification
+                JsonNode messageNode = objectMapper.readTree(message.body());
+                String orderJson = messageNode.get("Message").asText();
+
+                System.out.println(orderJson);
+
+                // Deserialize the order JSON to an Order object
+                Order order = objectMapper.readValue(orderJson, Order.class);
+                finalizeOrder(order);
+
+                DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
+                        .queueUrl(queueUrl)
+                        .receiptHandle(message.receiptHandle())
+                        .build();
+
+                sqsClient.deleteMessage(deleteRequest);
+            } catch (JsonProcessingException e) {
+                e.printStackTrace();
             }
-
-            for (Message message : messages) {
-                try {
-                    // Extract the "Message" field from the SNS notification
-                    JsonNode messageNode = objectMapper.readTree(message.body());
-                    String orderJson = messageNode.get("Message").asText();
-
-                    System.out.println(orderJson);
-
-                    // Deserialize the order JSON to an Order object
-                    Order order = objectMapper.readValue(orderJson, Order.class);
-                    finalizeOrder(order);
-
-                    DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
-                            .queueUrl(queueUrl)
-                            .receiptHandle(message.receiptHandle())
-                            .build();
-
-                    sqsClient.deleteMessage(deleteRequest);
-                } catch (JsonProcessingException e) {
-                    e.printStackTrace();
-                }
-            }
-            System.out.println("Processed orders in background: " + messages.size());
         }
+        System.out.println("Processed orders in background: " + messages.size());
     }
 
     @PostMapping
